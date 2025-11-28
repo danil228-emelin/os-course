@@ -210,58 +210,64 @@ pid_t create_process() {
     return syscall(SYS_clone3, &args, sizeof(args));
 }
 
-// Выполнение одной команды
+/// Выполнение одной команды
 int execute_command(char **args, int arg_count, char **redir_ops, char **redir_files, int redir_count, int background) {
-    if (arg_count == 0) {
-        return 0;
-    }
-    
-    // Проверка на exit
-    if (strcmp(args[0], "exit") == 0) {
-        exit(EXIT_SUCCESS);
-    }
-    
-    // Проверка на специальные команды
-    if (is_special_command(args[0])) {
-        if (redir_count > 0) {
-            fprintf(stderr, "Special commands do not support redirections\n");
-            return 1;
-        }
-        return exec_spec_commands(args) ? 0 : 1;
-    }
-    
-    // Создание процесса через clone3
-    pid_t pid = create_process();
-    if (pid == -1) {
-        perror("clone3");
-        return 1;
-    }
-    
-    if (pid == 0) {
-        // Дочерний процесс
-        if (redir_count > 0) {
-            apply_redirections(redir_ops, redir_files, redir_count);
-        }
-        
-        execvp(args[0], args);
-        perror("execvp");
-        exit(1);
-    }
-    
-    // Родительский процесс
-    if (background) {
-        add_background_process(pid);
-        return 0;
-    } else {
-        int status;
-        waitpid(pid, &status, 0);
-        
-        if (WIFEXITED(status)) {
-            return WEXITSTATUS(status);
-        } else {
-            return 1;
-        }
-    }
+  if (arg_count == 0) {
+      return 0;
+  }
+  
+  // Проверка на exit
+  if (strcmp(args[0], "exit") == 0) {
+      exit(EXIT_SUCCESS);
+  }
+  
+  // Проверка на специальные команды
+  if (is_special_command(args[0])) {
+      if (redir_count > 0) {
+          fprintf(stderr, "Special commands do not support redirections\n");
+          return 1;
+      }
+      return exec_spec_commands(args) ? 0 : 1;
+  }
+  
+  // Создание процесса через clone3
+  pid_t pid = create_process();
+  if (pid == -1) {
+      perror("clone3");
+      return 1;
+  }
+  
+  if (pid == 0) {
+      // Дочерний процесс
+      if (redir_count > 0) {
+          apply_redirections(redir_ops, redir_files, redir_count);
+      }
+      
+      execvp(args[0], args);
+      
+      // Если execvp вернул управление, значит произошла ошибка
+      // Проверяем тип ошибки - выводим "Command not found" только для ENOENT
+      if (errno == ENOENT) {
+          fprintf(stdout, "Command not found\n");
+      }
+      // Для других ошибок (EACCES, ENOEXEC и т.д.) не выводим сообщение
+      exit(127);
+  }
+  
+  // Родительский процесс
+  if (background) {
+      add_background_process(pid);
+      return 0;
+  } else {
+      int status;
+      waitpid(pid, &status, 0);
+      
+      if (WIFEXITED(status)) {
+          return WEXITSTATUS(status);
+      } else {
+          return 1;
+      }
+  }
 }
 
 // Разбор пайплайна (на основе C++ логики)
