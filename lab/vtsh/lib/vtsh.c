@@ -204,12 +204,11 @@ int parse_args(char *input, char **args, char **redir_ops, char **redir_files, i
 
 // Создание процесса через sys_clone3
 pid_t create_process() {
-    struct clone_args args = {};
-    args.flags = 0;
-    args.exit_signal = SIGCHLD;
-    return syscall(SYS_clone3, &args, sizeof(args));
+  struct clone_args args = {};
+  args.flags = CLONE_FILES;  // Делиться таблицей файловых дескрипторов
+  args.exit_signal = SIGCHLD;
+  return syscall(SYS_clone3, &args, sizeof(args));
 }
-
 /// Выполнение одной команды
 int execute_command(char **args, int arg_count, char **redir_ops, char **redir_files, int redir_count, int background) {
   if (arg_count == 0) {
