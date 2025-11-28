@@ -1,18 +1,19 @@
-  #include <vtsh.h>
-  #include <stdio.h>
-  #include <stdlib.h>
-  #include <string.h>
-  #include <unistd.h>
-  #include <sys/wait.h>
-  #include <sys/types.h>
-  #include <fcntl.h>
-  #include <signal.h>
-  #include <errno.h>
-  #include <time.h>
-  #include <linux/sched.h>
-  #include <sys/syscall.h>
-  #include <limits.h>
-  int main() {
+#include <vtsh.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <sys/types.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <errno.h>
+#include <time.h>
+#include <linux/sched.h>
+#include <sys/syscall.h>
+#include <limits.h>
+
+int main() {
     char input[1024];
     int interactive = isatty(STDIN_FILENO);
     
@@ -41,118 +42,151 @@
             }
         }
         
-        // Удаление символа новой строки
-        input[strcspn(input, "\n")] = 0;
+        // Обработка многострочного ввода
+        char *lines[100];
+        int line_count = 0;
         
-        // Пропуск пустых строк
-        if (strlen(input) == 0) {
-            continue;
+        // Разбиваем входные данные по символам \n
+        char input_copy[1024];
+        strncpy(input_copy, input, sizeof(input_copy) - 1);
+        input_copy[sizeof(input_copy) - 1] = '\0';
+        
+        char *line = strtok(input_copy, "\n");
+        while (line != NULL && line_count < 100) {
+            lines[line_count++] = line;
+            line = strtok(NULL, "\n");
         }
         
-        // Специальная обработка для команды cat без аргументов
-        if (strcmp(input, "cat") == 0) {
-            // Читаем stdin до EOF и выводим его содержимое
-            char buffer[1024];
-            while (fgets(buffer, sizeof(buffer), stdin) != NULL) {
-                // Убираем символ новой строки если нужно
-                buffer[strcspn(buffer, "\n")] = 0;
-                printf("%s\n", buffer);
-            }
-            continue;
-        }
-        
-        // Проверка на фоновое выполнение
-        int background = 0;
-        char *trimmed = input;
-        char *bg_check = trimmed + strlen(trimmed) - 1;
-        
-        if (bg_check > trimmed && *bg_check == '&') {
-            background = 1;
-            *bg_check = '\0';
-            // Убираем пробелы перед &
-            while (bg_check > trimmed && (*(bg_check-1) == ' ' || *(bg_check-1) == '\t')) {
-                bg_check--;
-                *bg_check = '\0';
-            }
-        }
-        
-        // Проверка на пайплайн
-        if (strchr(trimmed, '|') != NULL) {
-            char ***pipeline_commands = malloc(MAX_PIPES * sizeof(char**));
-            int cmd_count = 0;
+        // Обрабатываем каждую строку отдельно
+        for (int i = 0; i < line_count; i++) {
+            char *current_line = lines[i];
             
-            char pipeline_input[1024];
-            strcpy(pipeline_input, trimmed);
-            
-            if (parse_pipeline(pipeline_input, pipeline_commands, &cmd_count) >= 2) {
-                // Проверяем специальные команды в пайплайне
-                int invalid_special = 0;
-                for (int j = 0; j < cmd_count; j++) {
-                    if (pipeline_commands[j] != NULL && pipeline_commands[j][0] != NULL && 
-                        is_special_command(pipeline_commands[j][0])) {
-                        fprintf(stderr, "Special commands cannot be used in pipeline\n");
-                        invalid_special = 1;
-                        break;
-                    }
-                }
-                
-                if (!invalid_special) {
-                    if (background) {
-                        fprintf(stderr, "Background execution not supported for pipelines\n");
-                    } else {
-                        execute_pipeline(pipeline_commands, cmd_count);
-                    }
-                }
-                
-                // Освобождаем память
-                for (int j = 0; j < cmd_count; j++) {
-                    if (pipeline_commands[j] != NULL) {
-                        for (int k = 0; pipeline_commands[j][k] != NULL; k++) {
-                            free(pipeline_commands[j][k]);
-                        }
-                        free(pipeline_commands[j]);
-                    }
-                }
-                free(pipeline_commands);
+            // Пропуск пустых строк
+            if (current_line == NULL || strlen(current_line) == 0) {
                 continue;
             }
-            free(pipeline_commands);
-        }
-        
-        // Обычная команда
-        char *args[MAX_ARGS];
-        char *redir_ops[MAX_ARGS / 2];
-        char *redir_files[MAX_ARGS / 2];
-        int redir_count = 0;
-        
-        char command_input[1024];
-        strcpy(command_input, trimmed);
-        
-        int arg_count = parse_args(command_input, args, redir_ops, redir_files, &redir_count);
-        if (arg_count <= 0) {
-            continue;
-        }
-        
-        // Проверка на логическое OR
-        int has_or = 0;
-        for (int j = 0; j < arg_count; j++) {
-            if (args[j] != NULL && strcmp(args[j], "||") == 0) {
-                has_or = 1;
-                break;
+            
+            // Убираем пробелы по краям
+            char *trimmed = current_line;
+            while (*trimmed == ' ' || *trimmed == '\t') trimmed++;
+            char *trim_end = trimmed + strlen(trimmed) - 1;
+            while (trim_end > trimmed && (*trim_end == ' ' || *trim_end == '\t')) trim_end--;
+            *(trim_end + 1) = '\0';
+            
+            if (strlen(trimmed) == 0) {
+                continue;
             }
-        }
-        
-        if (has_or) {
-            if (background) {
-                fprintf(stderr, "Background execution not supported for || operator\n");
-            } else {
-                handle_or_command(args, arg_count);
+
+            // Специальная обработка для команды cat без аргументов
+            if (strcmp(trimmed, "cat") == 0) {
+                // Читаем stdin до EOF и выводим его содержимое
+                char buffer[1024];
+                while (fgets(buffer, sizeof(buffer), stdin) != NULL) {
+                    // Убираем символ новой строки если нужно
+                    buffer[strcspn(buffer, "\n")] = 0;
+                    printf("%s\n", buffer);
+                    fflush(stdout);
+                }
+                continue;
             }
-            continue;
+            
+            // Проверка на фоновое выполнение
+            int background = 0;
+            char *bg_check = trimmed + strlen(trimmed) - 1;
+            
+            if (bg_check >= trimmed && *bg_check == '&') {
+                background = 1;
+                *bg_check = '\0';
+                // Убираем пробелы перед &
+                while (bg_check > trimmed && (*(bg_check-1) == ' ' || *(bg_check-1) == '\t')) {
+                    bg_check--;
+                    *bg_check = '\0';
+                }
+                // Еще раз убираем пробелы по краям
+                while (*trimmed == ' ' || *trimmed == '\t') trimmed++;
+                trim_end = trimmed + strlen(trimmed) - 1;
+                while (trim_end > trimmed && (*trim_end == ' ' || *trim_end == '\t')) trim_end--;
+                *(trim_end + 1) = '\0';
+            }
+            
+            // Проверка на пайплайн
+            if (strchr(trimmed, '|') != NULL) {
+                char ***pipeline_commands = malloc(MAX_PIPES * sizeof(char**));
+                int cmd_count = 0;
+                
+                char pipeline_input[1024];
+                strcpy(pipeline_input, trimmed);
+                
+                if (parse_pipeline(pipeline_input, pipeline_commands, &cmd_count) >= 2) {
+                    // Проверяем специальные команды в пайплайне
+                    int invalid_special = 0;
+                    for (int j = 0; j < cmd_count; j++) {
+                        if (pipeline_commands[j] != NULL && pipeline_commands[j][0] != NULL && 
+                            is_special_command(pipeline_commands[j][0])) {
+                            fprintf(stderr, "Special commands cannot be used in pipeline\n");
+                            invalid_special = 1;
+                            break;
+                        }
+                    }
+                    
+                    if (!invalid_special) {
+                        if (background) {
+                            fprintf(stderr, "Background execution not supported for pipelines\n");
+                        } else {
+                            execute_pipeline(pipeline_commands, cmd_count);
+                        }
+                    }
+                    
+                    // Освобождаем память
+                    for (int j = 0; j < cmd_count; j++) {
+                        if (pipeline_commands[j] != NULL) {
+                            for (int k = 0; pipeline_commands[j][k] != NULL; k++) {
+                                free(pipeline_commands[j][k]);
+                            }
+                            free(pipeline_commands[j]);
+                        }
+                    }
+                    free(pipeline_commands);
+                    continue;
+                }
+                free(pipeline_commands);
+            }
+            
+            // Обычная команда
+            char *args[MAX_ARGS];
+            char *redir_ops[MAX_ARGS / 2];
+            char *redir_files[MAX_ARGS / 2];
+            int redir_count = 0;
+            
+            char command_input[1024];
+            strcpy(command_input, trimmed);
+            
+            int arg_count = parse_args(command_input, args, redir_ops, redir_files, &redir_count);
+            if (arg_count <= 0) {
+                continue;
+            }
+            
+            // Проверка на логическое OR
+            int has_or = 0;
+            for (int j = 0; j < arg_count; j++) {
+                if (args[j] != NULL && strcmp(args[j], "||") == 0) {
+                    has_or = 1;
+                    break;
+                }
+            }
+            
+            if (has_or) {
+                if (background) {
+                    fprintf(stderr, "Background execution not supported for || operator\n");
+                } else {
+                    handle_or_command(args, arg_count);
+                }
+                continue;
+            }
+            
+            // Выполнение команды
+            execute_command(args, arg_count, redir_ops, redir_files, redir_count, background);
         }
-        
-        // Выполнение команды
-        int exit_code = execute_command(args, arg_count, redir_ops, redir_files, redir_count, background);
     }
     
     // Завершение фоновых процессов при выходе
