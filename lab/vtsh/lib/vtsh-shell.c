@@ -487,3 +487,171 @@ int handle_or_command(char **args, int arg_count) {
     
     return exit_code;
 }
+
+// Основной цикл shell
+int main() {
+    char input[1024];
+    int interactive = isatty(STDIN_FILENO);
+    
+    // Установка обработчиков сигналов
+    signal(SIGINT, handle_signal);
+    signal(SIGQUIT, handle_signal);
+    
+    while (1) {
+        cleanup_background_processes();
+        
+        if (interactive) {
+            printf("%s", vtsh_prompt());
+            fflush(stdout);
+        }
+        
+        if (fgets(input, sizeof(input), stdin) == NULL) {
+            if (feof(stdin)) {
+                // Ctrl+D
+                printf("\n");
+                break;
+            } else {
+                perror("fgets");
+                continue;
+            }
+        }
+        
+        // Удаление символа новой строки
+        input[strcspn(input, "\n")] = 0;
+        
+        // Пропуск пустых строк
+        if (strlen(input) == 0) {
+            continue;
+        }
+        
+        // Обработка escape-последовательностей (\n -> n)
+        char cleaned_input[1024];
+        int clean_index = 0;
+        for (int i = 0; input[i] != '\0'; i++) {
+            if (input[i] == '\\' && input[i + 1] != '\0') {
+                cleaned_input[clean_index++] = input[++i];
+            } else {
+                cleaned_input[clean_index++] = input[i];
+            }
+        }
+        cleaned_input[clean_index] = '\0';
+        
+        // Убираем пробелы по краям
+        char *trimmed = cleaned_input;
+        while (*trimmed == ' ' || *trimmed == '\t') trimmed++;
+        char *trim_end = trimmed + strlen(trimmed) - 1;
+        while (trim_end > trimmed && (*trim_end == ' ' || *trim_end == '\t')) trim_end--;
+        *(trim_end + 1) = '\0';
+        
+        if (strlen(trimmed) == 0) {
+            continue;
+        }
+        
+        // Проверка на фоновое выполнение
+        int background = 0;
+        if (trim_end > trimmed && *trim_end == '&') {
+            background = 1;
+            *trim_end = '\0';
+            // Убираем пробелы перед &
+            while (trim_end > trimmed && (*(trim_end-1) == ' ' || *(trim_end-1) == '\t')) trim_end--;
+            *trim_end = '\0';
+        }
+        
+        // Проверка на пайплайн
+        if (strchr(trimmed, '|') != NULL) {
+            char **pipeline_commands[MAX_PIPES];  // Исправлено: char ** вместо char *
+            int cmd_count = 0;
+            
+            char pipeline_input[1024];
+            strcpy(pipeline_input, trimmed);
+            
+            if (parse_pipeline(pipeline_input, pipeline_commands, &cmd_count) >= 2) {
+                // Проверяем специальные команды в пайплайне
+                int invalid_special = 0;
+                for (int i = 0; i < cmd_count; i++) {
+                    if (pipeline_commands[i] != NULL && pipeline_commands[i][0] != NULL && 
+                        is_special_command(pipeline_commands[i][0])) {
+                        fprintf(stderr, "Special commands cannot be used in pipeline\n");
+                        invalid_special = 1;
+                        break;
+                    }
+                }
+                
+                if (!invalid_special) {
+                    if (background) {
+                        fprintf(stderr, "Background execution not supported for pipelines\n");
+                    } else {
+                        execute_pipeline(pipeline_commands, cmd_count);
+                    }
+                }
+                
+                // Освобождаем память
+                for (int i = 0; i < cmd_count; i++) {
+                    free(pipeline_commands[i]);
+                }
+                continue;
+            }
+        }
+        
+        // Обычная команда
+        char *args[MAX_ARGS];
+        char *redir_ops[MAX_ARGS / 2];
+        char *redir_files[MAX_ARGS / 2];
+        int redir_count = 0;
+        
+        char command_input[1024];
+        strcpy(command_input, trimmed);
+        
+        int arg_count = parse_args(command_input, args, redir_ops, redir_files, &redir_count);
+        if (arg_count <= 0) {
+            continue;
+        }
+        
+        // Проверка на логическое OR
+        int has_or = 0;
+        for (int i = 0; i < arg_count; i++) {
+            if (strcmp(args[i], "||") == 0) {
+                has_or = 1;
+                break;
+            }
+        }
+        
+        if (has_or) {
+            if (background) {
+                fprintf(stderr, "Background execution not supported for || operator\n");
+            } else {
+                handle_or_command(args, arg_count);
+            }
+            continue;
+        }
+        
+        // Выполнение команды
+        struct timespec start_time, end_time;
+        clock_gettime(CLOCK_MONOTONIC, &start_time);
+        
+        int exit_code = execute_command(args, arg_count, redir_ops, redir_files, redir_count, background);
+        
+        clock_gettime(CLOCK_MONOTONIC, &end_time);
+        
+        if (!background && interactive) {
+            long elapsed_ms = (end_time.tv_sec - start_time.tv_sec) * 1000 + (end_time.tv_nsec - start_time.tv_nsec) / 1000000;
+            // Можно вывести время выполнения если нужно
+        }
+    }
+    
+    // Завершение фоновых процессов при выходе
+    if (interactive) {
+        printf("Waiting for background processes...\n");
+        for (int i = 0; i < bg_process_count; i++) {
+            int status;
+            kill(background_processes[i], SIGTERM);
+            sleep(1);
+            if (waitpid(background_processes[i], &status, WNOHANG) == 0) {
+                kill(background_processes[i], SIGKILL);
+                waitpid(background_processes[i], &status, 0);
+            }
+        }
+    }
+    
+    return 0;
+}
