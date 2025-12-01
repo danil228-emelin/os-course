@@ -10,7 +10,6 @@
 #include <sys/stat.h>
 #include <errno.h>
 
-
 #define BLOCK_SIZE 4096
 #define CACHE_COUNT 16
 
@@ -34,6 +33,7 @@ typedef struct file_descriptor {
     int fd;
     off_t offset;
     cache_t *cache;
+    off_t file_size; 
 } file_descriptor_t;
 
 #define MAX_OPEN_FILES 256
@@ -47,6 +47,7 @@ static void fd_table_init(void) {
         fd_table[i].fd = -1;
         fd_table[i].offset = 0;
         fd_table[i].cache = NULL;
+        fd_table[i].file_size = 0;
     }
     fd_table_initialized = true;
 }
@@ -81,12 +82,12 @@ static void cache_promote(cache_t *cache, cache_page_t *page) {
     if (!cache || !page) return;
     if (cache->head == page) return;
 
-    // Удаляем из текущей позиции
+    
     if (page->prev) page->prev->next = page->next;
     if (page->next) page->next->prev = page->prev;
     if (cache->tail == page) cache->tail = page->prev;
 
-    // Вставляем в начало
+    
     page->prev = NULL;
     page->next = cache->head;
     if (cache->head) cache->head->prev = page;
@@ -110,21 +111,21 @@ static void cache_evict(cache_t *cache) {
 
     cache_page_t *evicted = cache->tail;
     
-    // Записываем на диск если грязная
+    
     if (evicted->dirty) {
         cache_write_back(cache, evicted);
     }
 
-    // Удаляем из списка
+    
     if (evicted->prev) {
         evicted->prev->next = NULL;
     } else {
-        // Это единственная страница
+        
         cache->head = NULL;
     }
     cache->tail = evicted->prev;
 
-    // Освобождаем память
+    
     free(evicted->data);
     free(evicted);
     cache->size--;
@@ -135,9 +136,14 @@ int vtpc_open(const char* path, int mode, int access) {
         fd_table_init();
     }
 
-    // Убираем O_DIRECT для упрощения
     int real_fd = open(path, mode, access);
     if (real_fd < 0) {
+        return -1;
+    }
+
+    struct stat st;
+    if (fstat(real_fd, &st) < 0) {
+        close(real_fd);
         return -1;
     }
 
@@ -145,6 +151,7 @@ int vtpc_open(const char* path, int mode, int access) {
         if (fd_table[i].fd == -1) {
             fd_table[i].fd = real_fd;
             fd_table[i].offset = 0;
+            fd_table[i].file_size = st.st_size;
             fd_table[i].cache = cache_init(CACHE_COUNT, BLOCK_SIZE, real_fd);
             if (!fd_table[i].cache) {
                 close(real_fd);
@@ -168,7 +175,7 @@ int vtpc_close(int fd) {
     file_descriptor_t *file = &fd_table[fd];
     cache_t *cache = file->cache;
 
-    // Сбрасываем все грязные страницы
+    
     cache_page_t *page = cache->head;
     while (page) {
         cache_write_back(cache, page);
@@ -181,6 +188,7 @@ int vtpc_close(int fd) {
     fd_table[fd].fd = -1;
     fd_table[fd].cache = NULL;
     fd_table[fd].offset = 0;
+    fd_table[fd].file_size = 0;
     
     return 0;
 }
@@ -196,6 +204,16 @@ ssize_t vtpc_read(int fd, void *buf, size_t count) {
     cache_t *cache = file->cache;
     size_t block_size = cache->block_size;
 
+    
+    if (file->offset >= file->file_size) {
+        return 0; 
+    }
+
+    
+    if (file->offset + (off_t)count > file->file_size) {
+        count = file->file_size - file->offset;
+    }
+
     size_t total_read = 0;
     char *dest = (char *)buf;
     
@@ -203,7 +221,7 @@ ssize_t vtpc_read(int fd, void *buf, size_t count) {
         off_t block_offset = (file->offset / (off_t)block_size) * (off_t)block_size;
         size_t block_index = file->offset % block_size;
 
-        // Ищем страницу в кэше
+        
         cache_page_t *page = cache->head;
         while (page) {
             if (page->offset == block_offset) {
@@ -215,7 +233,7 @@ ssize_t vtpc_read(int fd, void *buf, size_t count) {
         if (page) {
             cache_promote(cache, page);
         } else {
-            // Страницы нет в кэше
+            
             if (cache->size >= cache->capacity) {
                 cache_evict(cache);
             }
@@ -233,15 +251,19 @@ ssize_t vtpc_read(int fd, void *buf, size_t count) {
                 return -1;
             }
 
-            // Читаем с диска
-            ssize_t read_bytes = pread(file->fd, page->data, block_size, block_offset);
+            
+            off_t file_remaining = file->file_size - block_offset;
+            size_t to_read = (file_remaining < (off_t)block_size) ? 
+                             (size_t)file_remaining : block_size;
+            
+            ssize_t read_bytes = pread(file->fd, page->data, to_read, block_offset);
             if (read_bytes < 0) {
                 free(page->data);
                 free(page);
                 return -1;
             }
             
-            // Заполняем нулями если прочитали меньше
+            
             if (read_bytes < (ssize_t)block_size) {
                 memset((char*)page->data + read_bytes, 0, block_size - read_bytes);
             }
@@ -256,9 +278,14 @@ ssize_t vtpc_read(int fd, void *buf, size_t count) {
             cache->size++;
         }
 
-        // Копируем данные из страницы
-        size_t available = block_size - block_index;
-        size_t to_copy = (count > available) ? available : count;
+        
+        size_t available_in_block = block_size - block_index;
+        size_t available_in_file = file->file_size - file->offset;
+        size_t to_copy = count;
+        
+        if (to_copy > available_in_block) to_copy = available_in_block;
+        if (to_copy > available_in_file) to_copy = available_in_file;
+        
         memcpy(dest + total_read, (char*)page->data + block_index, to_copy);
         
         total_read += to_copy;
@@ -283,11 +310,16 @@ ssize_t vtpc_write(int fd, const void *buf, size_t count) {
     const char *src = (const char *)buf;
     size_t bytes_written = 0;
 
+    
+    if (file->offset + (off_t)count > file->file_size) {
+        file->file_size = file->offset + count;
+    }
+
     while (count > 0) {
         off_t block_offset = (file->offset / (off_t)block_size) * (off_t)block_size;
         size_t block_index = file->offset % block_size;
 
-        // Ищем страницу в кэше
+        
         cache_page_t *page = cache->head;
         while (page) {
             if (page->offset == block_offset) break;
@@ -295,7 +327,7 @@ ssize_t vtpc_write(int fd, const void *buf, size_t count) {
         }
 
         if (!page) {
-            // Страницы нет - создаем новую или вытесняем старую
+            
             if (cache->size >= cache->capacity) {
                 cache_evict(cache);
             }
@@ -313,13 +345,24 @@ ssize_t vtpc_write(int fd, const void *buf, size_t count) {
                 return -1;
             }
 
-            // Читаем существующие данные с диска
-            ssize_t read_bytes = pread(file->fd, page->data, block_size, block_offset);
-            if (read_bytes < 0 && errno != EINVAL) {
-                // EINVAL может быть если блок за пределами файла
+            
+            if (block_offset < file->file_size) {
+                off_t file_remaining = file->file_size - block_offset;
+                size_t to_read = (file_remaining < (off_t)block_size) ? 
+                                 (size_t)file_remaining : block_size;
+                
+                ssize_t read_bytes = pread(file->fd, page->data, to_read, block_offset);
+                if (read_bytes < 0 && errno != EINVAL) {
+                    
+                    memset(page->data, 0, block_size);
+                } else if (read_bytes >= 0 && read_bytes < (ssize_t)block_size) {
+                    memset((char*)page->data + read_bytes, 0, block_size - read_bytes);
+                } else {
+                    memset(page->data, 0, block_size);
+                }
+            } else {
+                
                 memset(page->data, 0, block_size);
-            } else if (read_bytes < (ssize_t)block_size) {
-                memset((char*)page->data + read_bytes, 0, block_size - read_bytes);
             }
 
             page->offset = block_offset;
@@ -334,7 +377,7 @@ ssize_t vtpc_write(int fd, const void *buf, size_t count) {
 
         cache_promote(cache, page);
 
-        // Копируем данные в страницу
+        
         size_t to_copy = (count > block_size - block_index) ? block_size - block_index : count;
         memcpy((char*)page->data + block_index, src + bytes_written, to_copy);
         page->dirty = true;
@@ -355,7 +398,6 @@ off_t vtpc_lseek(int fd, off_t offset, int whence) {
 
     file_descriptor_t *file = &fd_table[fd];
     off_t new_offset;
-    struct stat st;
 
     switch (whence) {
         case SEEK_SET:
@@ -364,10 +406,11 @@ off_t vtpc_lseek(int fd, off_t offset, int whence) {
         case SEEK_CUR:
             new_offset = file->offset + offset;
             break;
-        case SEEK_END:
-            if (fstat(file->fd, &st) < 0) return -1;
-            new_offset = st.st_size + offset;
+        case SEEK_END: {
+            
+            new_offset = file->file_size + offset;
             break;
+        }
         default:
             errno = EINVAL;
             return -1;
@@ -391,7 +434,7 @@ int vtpc_fsync(int fd) {
     file_descriptor_t *file = &fd_table[fd];
     cache_t *cache = file->cache;
     
-    // Сбрасываем все грязные страницы
+    
     cache_page_t *page = cache->head;
     while (page) {
         if (page->dirty) {
@@ -400,6 +443,11 @@ int vtpc_fsync(int fd) {
             }
         }
         page = page->next;
+    }
+
+    
+    if (ftruncate(file->fd, file->file_size) < 0) {
+        return -1;
     }
 
     return fsync(file->fd);
